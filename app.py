@@ -1,202 +1,117 @@
-import os
-import urllib.request
-import warnings
-warnings.filterwarnings('ignore')
-
-import numpy as np
-import pandas as pd
+import math
+import heapq
 import streamlit as st
+import pandas as pd
 import matplotlib.pyplot as plt
-from scipy import stats
-from sklearn.ensemble import RandomForestRegressor, IsolationForest
-from sklearn.linear_model import LinearRegression
-from sklearn.cluster import KMeans
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
-st.set_page_config(page_title='WattWise | Energy Intelligence', page_icon='⚡', layout='wide')
-DATA_FILE = 'energydata_complete.csv'
-DATA_URL = 'https://archive.ics.uci.edu/ml/machine-learning-databases/00374/energydata_complete.csv'
+st.set_page_config(page_title="AI Route Finder", page_icon="🧭", layout="wide")
 
-@st.cache_data(show_spinner=False)
-def load_data():
-    if not os.path.exists(DATA_FILE):
-        urllib.request.urlretrieve(DATA_URL, DATA_FILE)
-    df = pd.read_csv(DATA_FILE, parse_dates=['date'])
-    df = df.drop_duplicates().sort_values('date').reset_index(drop=True)
-    return df
+# Demonstration city graph from the original Tkinter project.
+NODES = {
+    "A": {"name": "Home", "pos": (0.5, 1.1)},
+    "B": {"name": "Main Market", "pos": (2.5, 2.2)},
+    "C": {"name": "Tech Park", "pos": (5.0, 3.2)},
+    "D": {"name": "Riverside Ave", "pos": (2.5, 0.5)},
+    "E": {"name": "Old Town", "pos": (5.0, 0.5)},
+    "F": {"name": "Bus Depot", "pos": (7.3, 2.2)},
+    "G": {"name": "College", "pos": (9.2, 0.5)},
+    "H": {"name": "Hospital", "pos": (5.0, 1.8)},
+}
+# a, b, distance km, base speed km/h, safety /10, base traffic /10
+RAW_EDGES = [
+    ("A", "B", 2.1, 30, 7, 3), ("A", "D", 2.6, 25, 8, 2),
+    ("B", "C", 3.4, 45, 3, 2), ("B", "H", 2.0, 30, 7, 3),
+    ("D", "E", 3.0, 28, 8, 3), ("D", "H", 2.4, 25, 7, 3),
+    ("H", "E", 2.2, 25, 8, 2), ("H", "C", 2.8, 35, 5, 5),
+    ("C", "F", 2.5, 50, 3, 2), ("E", "G", 3.6, 28, 7, 3),
+    ("F", "G", 3.0, 45, 3, 2), ("E", "F", 3.8, 30, 4, 6),
+]
 
-st.title('⚡ WattWise')
-st.subheader('Uncertainty-Aware Energy Intelligence & Anomaly Detection')
-st.caption('A Statistical Machine Learning project using real appliance-energy data from the UCI Machine Learning Repository.')
+def traffic_for(base, time):
+    bump = 2 if time in ("Morning Rush", "Evening Rush") else 0
+    return min(10, max(0, base + bump))
 
-with st.spinner('Loading real energy dataset (first run may take a minute)...'):
-    try:
-        df = load_data()
-    except Exception as e:
-        st.error('Could not download the dataset automatically. Check your internet connection and try again. Details: ' + str(e))
-        st.markdown('Dataset link: https://archive.ics.uci.edu/dataset/374/appliances+energy+prediction')
-        st.stop()
+def edge_cost(e, priority, time):
+    a, b, dist, speed, safety, traffic = e
+    t = (dist / speed) * 60 * (1 + traffic_for(traffic, time) / 10)
+    return t + (10 - safety) * 4 if priority == "Safety" else t
 
-# Feature engineering: only predictors available in the dataset, plus time features.
-df['hour'] = df['date'].dt.hour
-df['day_of_week'] = df['date'].dt.dayofweek
-df['is_weekend'] = (df['day_of_week'] >= 5).astype(int)
-TARGET = 'Appliances'
-features = ['lights', 'T1', 'RH_1', 'T2', 'RH_2', 'T_out', 'RH_out', 'Windspeed', 'Visibility', 'hour', 'day_of_week', 'is_weekend']
-features = [c for c in features if c in df.columns]
+def shortest_route(start, end, priority, time):
+    adj = {n: [] for n in NODES}
+    for e in RAW_EDGES:
+        a, b, *_ = e
+        adj[a].append((b, e)); adj[b].append((a, (b, a, *e[2:])))
+    distances = {n: math.inf for n in NODES}; distances[start] = 0
+    previous = {}; pq = [(0, start)]; visited = set()
+    while pq:
+        d, u = heapq.heappop(pq)
+        if u in visited: continue
+        visited.add(u)
+        if u == end: break
+        for v, e in adj[u]:
+            nd = d + edge_cost(e, priority, time)
+            if nd < distances[v]:
+                distances[v] = nd; previous[v] = (u, e); heapq.heappush(pq, (nd, v))
+    if start != end and end not in previous: return None
+    path = [end]; route_edges = []; cur = end
+    while cur != start:
+        prev, e = previous[cur]; route_edges.append(e); path.append(prev); cur = prev
+    path.reverse(); route_edges.reverse()
+    distance = sum(e[2] for e in route_edges)
+    minutes = sum((e[2] / e[3]) * 60 * (1 + traffic_for(e[5], time) / 10) for e in route_edges)
+    safety = sum(e[4] for e in route_edges) / len(route_edges) if route_edges else 0
+    return path, route_edges, {"Distance (km)": distance, "Estimated time (min)": minutes, "Average safety (/10)": safety}
 
-# Sidebar controls
-st.sidebar.header('Project controls')
-model_choice = st.sidebar.selectbox('Prediction model', ['Random Forest', 'Linear Regression'])
-train_fraction = st.sidebar.slider('Training data proportion (chronological split)', 0.60, 0.90, 0.80, 0.05)
-cluster_k = st.sidebar.slider('Usage clusters (K-means)', 2, 5, 3)
+def road_colour(e):
+    safety, traffic = e[4], e[5]
+    if traffic <= 3 and safety >= 7: return "#2a9d8f"
+    if traffic >= 7 or safety <= 3: return "#e76f51"
+    return "#e9c46a"
 
-# Metrics
-c1, c2, c3, c4 = st.columns(4)
-c1.metric('Dataset records', f'{len(df):,}')
-c2.metric('Features used', str(len(features)))
-c3.metric('Average appliance use', f'{df[TARGET].mean():.1f} Wh')
-c4.metric('Missing values', f'{int(df.isna().sum().sum()):,}')
+st.title("🧭 AI Route Finder System")
+st.caption("Smart route planning using Dijkstra's algorithm with speed or safety priority.")
+st.info("This demonstration uses a sample city graph and simulated traffic conditions. It does not use live GPS or real-time traffic feeds.")
 
-st.markdown('### 1. Consumption overview')
-left, right = st.columns(2)
-with left:
-    fig, ax = plt.subplots(figsize=(8, 3.5))
-    daily = df.set_index('date')[TARGET].resample('D').mean()
-    ax.plot(daily.index, daily.values)
-    ax.set_title('Daily average appliance energy use')
-    ax.set_ylabel('Energy (Wh per 10-minute reading)')
-    ax.set_xlabel('Date')
-    fig.tight_layout()
-    st.pyplot(fig)
-    plt.close(fig)
-with right:
-    fig, ax = plt.subplots(figsize=(8, 3.5))
-    ax.hist(df[TARGET], bins=35, edgecolor='white')
-    ax.set_title('Distribution of appliance energy use')
-    ax.set_xlabel('Energy (Wh)')
-    ax.set_ylabel('Frequency')
-    fig.tight_layout()
-    st.pyplot(fig)
-    plt.close(fig)
+names = {v["name"]: k for k, v in NODES.items()}
+c1, c2, c3 = st.columns(3)
+with c1: start_name = st.selectbox("From", list(names.keys()), index=0)
+with c2: end_name = st.selectbox("Destination", list(names.keys()), index=6)
+with c3: time = st.selectbox("Time of day", ["Day", "Night", "Morning Rush", "Evening Rush"])
+priority = st.radio("Route priority", ["Speed", "Safety"], horizontal=True)
 
-st.markdown('### 2. Predictive modelling')
-X = df[features].replace([np.inf, -np.inf], np.nan).fillna(df[features].median(numeric_only=True))
-y = df[TARGET].astype(float)
-split = int(len(df) * train_fraction)
-X_train, X_test = X.iloc[:split], X.iloc[split:]
-y_train, y_test = y.iloc[:split], y.iloc[split:]
-if model_choice == 'Random Forest':
-    model = RandomForestRegressor(n_estimators=100, min_samples_leaf=2, random_state=42, n_jobs=-1)
+if start_name == end_name:
+    st.warning("Please select different start and destination locations.")
 else:
-    model = LinearRegression()
-model.fit(X_train, y_train)
-pred = model.predict(X_test)
-mae = mean_absolute_error(y_test, pred)
-rmse = np.sqrt(mean_squared_error(y_test, pred))
-r2 = r2_score(y_test, pred)
-a, b, c = st.columns(3)
-a.metric('MAE', f'{mae:.2f} Wh', help='Mean absolute prediction error; lower is better.')
-b.metric('RMSE', f'{rmse:.2f} Wh', help='Penalizes larger errors; lower is better.')
-c.metric('R²', f'{r2:.3f}', help='Relative fit score; may be negative on a difficult test set.')
+    result = shortest_route(names[start_name], names[end_name], priority, time)
+    if result:
+        path, route_edges, stats = result
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Distance", f"{stats['Distance (km)']:.2f} km")
+        m2.metric("Estimated travel time", f"{stats['Estimated time (min)']:.1f} min")
+        m3.metric("Average safety", f"{stats['Average safety (/10)']:.1f}/10")
+        st.subheader("Recommended route")
+        st.success(" → ".join(NODES[n]["name"] for n in path))
 
-fig, ax = plt.subplots(figsize=(11, 3.5))
-show_n = min(300, len(y_test))
-ax.plot(df['date'].iloc[split:split+show_n], y_test.iloc[:show_n].values, label='Actual', linewidth=1.5)
-ax.plot(df['date'].iloc[split:split+show_n], pred[:show_n], label='Predicted', linewidth=1.2)
-ax.set_title('Actual vs predicted consumption (first test observations)')
-ax.set_ylabel('Energy (Wh)')
-ax.legend()
-fig.autofmt_xdate()
-fig.tight_layout()
-st.pyplot(fig)
-plt.close(fig)
-
-# Bootstrap interval for the mean absolute error, descriptive uncertainty estimate.
-rng = np.random.default_rng(42)
-abs_errors = np.abs(y_test.to_numpy() - pred)
-if len(abs_errors) > 1:
-    boot_means = [rng.choice(abs_errors, size=len(abs_errors), replace=True).mean() for _ in range(500)]
-    lo, hi = np.percentile(boot_means, [2.5, 97.5])
-    st.info(f'Bootstrap 95% interval for mean absolute error: **{lo:.2f} to {hi:.2f} Wh**. This describes uncertainty in the test-set MAE, not a guaranteed interval for an individual forecast.')
-
-st.markdown('### 3. Statistical insight: weekday vs weekend')
-weekdays = df.loc[df['is_weekend'] == 0, TARGET]
-weekends = df.loc[df['is_weekend'] == 1, TARGET]
-if len(weekdays) and len(weekends):
-    t_stat, p_value = stats.ttest_ind(weekdays, weekends, equal_var=False, nan_policy='omit')
-    u, v = st.columns(2)
-    u.metric('Weekday mean', f'{weekdays.mean():.2f} Wh')
-    v.metric('Weekend mean', f'{weekends.mean():.2f} Wh')
-    st.write(f'Welch two-sample t-test: **t = {t_stat:.3f}**, **p-value = {p_value:.4g}**.')
-    if p_value < 0.05:
-        st.success('At the 5% significance level, this dataset shows a statistically significant difference between weekday and weekend average consumption. This does not prove that the day type causes the difference.')
-    else:
-        st.warning('At the 5% significance level, this test does not provide sufficient evidence of a weekday/weekend mean difference.')
-
-st.markdown('### 4. Unusual consumption detector')
-contamination = st.slider('Expected fraction of unusual readings (setting)', 0.01, 0.10, 0.03, 0.01)
-iso = IsolationForest(contamination=contamination, random_state=42, n_estimators=100)
-iso.fit(X)
-df_display = df[['date', TARGET]].copy()
-df_display['anomaly'] = iso.predict(X) == -1
-anoms = df_display[df_display['anomaly']].sort_values(TARGET, ascending=False)
-st.write(f'Flagged **{len(anoms):,}** readings as unusual out of **{len(df):,}** records. These are statistical flags, not proof of a fault or energy waste.')
-st.dataframe(anoms.head(12).rename(columns={'date':'Timestamp','Appliances':'Energy (Wh)','anomaly':'Flagged unusual'}), use_container_width=True, hide_index=True)
-
-st.markdown('### 5. Consumption pattern discovery (K-means + PCA)')
-cluster_features = ['Appliances', 'lights', 'T1', 'RH_1', 'T_out', 'RH_out', 'Windspeed']
-cluster_features = [c for c in cluster_features if c in df.columns]
-# Sample for responsive clustering; deterministic for repeatable demo.
-sample = df[cluster_features].sample(n=min(5000, len(df)), random_state=42).copy()
-scaler = StandardScaler()
-scaled = scaler.fit_transform(sample)
-km = KMeans(n_clusters=cluster_k, random_state=42, n_init=10)
-labels = km.fit_predict(scaled)
-pca = PCA(n_components=2, random_state=42)
-coords = pca.fit_transform(scaled)
-plot_df = pd.DataFrame({'PC1': coords[:,0], 'PC2': coords[:,1], 'Cluster': labels.astype(str)})
-fig, ax = plt.subplots(figsize=(8, 4))
-for label in sorted(plot_df['Cluster'].unique()):
-    part = plot_df[plot_df['Cluster'] == label]
-    ax.scatter(part['PC1'], part['PC2'], s=10, alpha=0.55, label=f'Cluster {label}')
-ax.set_title('Usage clusters visualized in 2D PCA space')
-ax.set_xlabel('Principal component 1')
-ax.set_ylabel('Principal component 2')
-ax.legend()
-fig.tight_layout()
-st.pyplot(fig)
-plt.close(fig)
-st.caption(f'The first two principal components explain {pca.explained_variance_ratio_.sum()*100:.1f}% of variance in this standardized sample.')
-cluster_summary = sample.assign(Cluster=labels).groupby('Cluster')[cluster_features].mean().round(2)
-st.write('Average feature values by cluster (use these values to interpret the groups):')
-st.dataframe(cluster_summary, use_container_width=True)
-
-st.markdown('### 6. Try a sample prediction')
-st.write('Change a few input values to see how the trained model responds. Values are illustrative inputs based on the dataset ranges.')
-latest = X.median(numeric_only=True)
-with st.form('prediction_form'):
-    inp = {}
-    cols = st.columns(3)
-    for i, feat in enumerate(features):
-        if feat in ['hour']:
-            mn, mx, step = 0, 23, 1
-        elif feat == 'day_of_week':
-            mn, mx, step = 0, 6, 1
-        elif feat == 'is_weekend':
-            mn, mx, step = 0, 1, 1
-        else:
-            mn = float(X[feat].quantile(0.01))
-            mx = float(X[feat].quantile(0.99))
-            step = max((mx - mn) / 100, 0.1)
-        inp[feat] = cols[i % 3].number_input(feat, min_value=float(mn), max_value=float(mx), value=float(np.clip(latest[feat], mn, mx)), step=float(step), key='input_'+feat)
-    submitted = st.form_submit_button('Predict energy use')
-if submitted:
-    row = pd.DataFrame([inp], columns=features)
-    value = float(model.predict(row)[0])
-    st.success(f'Predicted appliance energy use: **{value:.2f} Wh per 10-minute interval**')
-
-st.markdown('---')
-st.caption('Dataset: Candanedo et al. (2017), Appliances Energy Prediction, UCI Machine Learning Repository, CC BY 4.0. This is an educational prototype; it is not a utility billing tool or a safety monitor.')
+        fig, ax = plt.subplots(figsize=(11, 4.8))
+        for e in RAW_EDGES:
+            a, b = e[0], e[1]; x1, y1 = NODES[a]["pos"]; x2, y2 = NODES[b]["pos"]
+            ax.plot([x1, x2], [y1, y2], color=road_colour(e), linewidth=3, zorder=1)
+            ax.text((x1+x2)/2, (y1+y2)/2, f"{e[2]:.1f} km", fontsize=8, color="#555555", ha="center")
+        for i in range(len(path)-1):
+            x1, y1 = NODES[path[i]]["pos"]; x2, y2 = NODES[path[i+1]]["pos"]
+            ax.annotate("", xy=(x2,y2), xytext=(x1,y1), arrowprops={"arrowstyle":"->", "color":"#264653", "lw":3.2}, zorder=2)
+        for node, info in NODES.items():
+            x, y = info["pos"]
+            colour = "#2a9d8f" if node == path[0] else "#e63946" if node == path[-1] else "#3a5a8c"
+            ax.scatter(x, y, s=260, color=colour, edgecolors="white", linewidths=1.5, zorder=3)
+            ax.text(x, y+0.22, info["name"], ha="center", va="bottom", fontsize=9, weight="bold")
+        ax.set_xlim(-0.2, 10); ax.set_ylim(0, 3.8); ax.axis("off")
+        st.pyplot(fig, use_container_width=True)
+        with st.expander("Road details in selected route"):
+            rows = [{"From": NODES[e[0]]["name"], "To": NODES[e[1]]["name"], "Distance (km)": e[2], "Safety (/10)": e[4], "Simulated traffic (/10)": traffic_for(e[5], time)} for e in route_edges]
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        if st.button("Compare with fastest-only route"):
+            fast = shortest_route(names[start_name], names[end_name], "Speed", time)
+            _, _, fast_stats = fast
+            st.write("**Fastest-only route:** " + " → ".join(NODES[n]["name"] for n in fast[0]))
+            st.write(f"Distance: {fast_stats['Distance (km)']:.2f} km · Estimated time: {fast_stats['Estimated time (min)']:.1f} min · Average safety: {fast_stats['Average safety (/10)']:.1f}/10")
